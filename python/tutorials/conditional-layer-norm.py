@@ -29,6 +29,7 @@ In doing so, you will learn about:
 # where :math:`\epsilon` is a small constant added to the denominator for numerical stability.
 # Let’s first take a look at the forward pass implementation.
 
+import time
 import torch
 
 import triton
@@ -351,8 +352,12 @@ def test_layer_norm(M, N, dtype, eps=1e-5, device='cuda'):
     dy = .1 * torch.randn_like(x)
     x.requires_grad_(True)
     # forward pass
+    start = time.time()
     y_tri = layer_norm(x, w_shape, weight, bias, eps)
+    print('time for triton fwd pass', time.time() - start)
+    start = time.time()
     y_ref = vanilla_conditional_layer_norm(x, weight, bias, eps).to(dtype) #torch.nn.functional.layer_norm(x, w_shape, weight, bias, eps).to(dtype)
+    print('time for torch fwd pass', time.time() - start)
     assert torch.allclose(y_tri, y_ref, atol=1e-2, rtol=0)
 
 
@@ -370,6 +375,19 @@ def test_layer_norm(M, N, dtype, eps=1e-5, device='cuda'):
     assert torch.allclose(dw_tri, dw_ref, atol=1e-2, rtol=0)
 
 
+# @triton.testing.perf_report(
+#     triton.testing.Benchmark(
+#         x_names=['N'],
+#         x_vals=[512 * i for i in range(2, 32)],
+#         line_arg='provider',
+#         line_vals=['triton', 'torch'] + (['apex'] if HAS_APEX else []),
+#         line_names=['Triton', 'Torch'] + (['Apex'] if HAS_APEX else []),
+#         styles=[('blue', '-'), ('green', '-'), ('orange', '-')],
+#         ylabel='GB/s',
+#         plot_name='layer-norm-backward',
+#         args={'M': 4096, 'dtype': torch.float16, 'mode': 'backward'}
+#     )
+# )
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=['N'],
@@ -379,16 +397,16 @@ def test_layer_norm(M, N, dtype, eps=1e-5, device='cuda'):
         line_names=['Triton', 'Torch'] + (['Apex'] if HAS_APEX else []),
         styles=[('blue', '-'), ('green', '-'), ('orange', '-')],
         ylabel='GB/s',
-        plot_name='layer-norm-backward',
-        args={'M': 4096, 'dtype': torch.float16, 'mode': 'backward'}
+        plot_name='layer-norm-forward',
+        args={'M': 4096, 'dtype': torch.float16, 'mode': 'forward'}
     )
 )
 def bench_layer_norm(M, N, dtype, provider, mode='backward', eps=1e-5, device='cuda'):
     # create data
     x_shape = (M, N)
     w_shape = (x_shape[-1], )
-    weight = torch.rand(w_shape, dtype=dtype, device='cuda', requires_grad=True)
-    bias = torch.rand(w_shape, dtype=dtype, device='cuda', requires_grad=True)
+    weight = torch.rand(x_shape, dtype=dtype, device='cuda', requires_grad=True)
+    bias = torch.rand(x_shape, dtype=dtype, device='cuda', requires_grad=True)
     x = -2.3 + 0.5 * torch.randn(x_shape, dtype=dtype, device='cuda')
     dy = .1 * torch.randn_like(x)
     x.requires_grad_(True)
@@ -397,7 +415,7 @@ def bench_layer_norm(M, N, dtype, provider, mode='backward', eps=1e-5, device='c
     if provider == 'triton':
         def y_fwd(): return layer_norm(x, w_shape, weight, bias, eps)  # noqa: F811, E704
     if provider == 'torch':
-        def y_fwd(): return torch.nn.functional.layer_norm(x, w_shape, weight, bias, eps)  # noqa: F811, E704
+        def y_fwd(): return vanilla_conditional_layer_norm(x, weight, bias, eps)  # noqa: F811, E704
     if provider == 'apex':
         apex_layer_norm = apex.normalization.FusedLayerNorm(
             w_shape).to(x.device).to(x.dtype)
@@ -417,9 +435,8 @@ def bench_layer_norm(M, N, dtype, provider, mode='backward', eps=1e-5, device='c
 
 
 test_layer_norm(1151, 8192, torch.float16)
-print('test passed')
-# bench_layer_norm.run(save_path='.', print_data=True)
-
+print('initial test passed')
+bench_layer_norm.run(save_path='.', print_data=True)
 # %%
 # References
 # ----------

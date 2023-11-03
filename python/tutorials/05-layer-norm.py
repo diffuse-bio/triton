@@ -29,6 +29,7 @@ In doing so, you will learn about:
 # where :math:`\epsilon` is a small constant added to the denominator for numerical stability.
 # Let’s first take a look at the forward pass implementation.
 
+import time
 import torch
 
 import triton
@@ -295,6 +296,7 @@ layer_norm = LayerNorm.apply
 
 
 def test_layer_norm(M, N, dtype, eps=1e-5, device='cuda'):
+
     # create data
     x_shape = (M, N)
     w_shape = (x_shape[-1], )
@@ -304,14 +306,22 @@ def test_layer_norm(M, N, dtype, eps=1e-5, device='cuda'):
     dy = .1 * torch.randn_like(x)
     x.requires_grad_(True)
     # forward pass
+    start = time.time()
     y_tri = layer_norm(x, w_shape, weight, bias, eps)
+    print('time for triton fwd pass', time.time() - start)
+    start = time.time()
     y_ref = torch.nn.functional.layer_norm(x, w_shape, weight, bias, eps).to(dtype)
+    print('time for torch fwd pass', time.time() - start)
     # backward pass (triton)
+    start = time.time()
     y_tri.backward(dy, retain_graph=True)
+    print('time for triton bwd pass', time.time() - start)
     dx_tri, dw_tri, db_tri = [_.grad.clone() for _ in [x, weight, bias]]
     x.grad, weight.grad, bias.grad = None, None, None
     # backward pass (torch)
+    start = time.time()
     y_ref.backward(dy, retain_graph=True)
+    print('time for torch bwd pass', time.time() - start)
     dx_ref, dw_ref, db_ref = [_.grad.clone() for _ in [x, weight, bias]]
     # compare
     assert torch.allclose(y_tri, y_ref, atol=1e-2, rtol=0)
@@ -335,6 +345,8 @@ def test_layer_norm(M, N, dtype, eps=1e-5, device='cuda'):
 )
 def bench_layer_norm(M, N, dtype, provider, mode='backward', eps=1e-5, device='cuda'):
     # create data
+    stream = torch.cuda.Stream()
+    torch.cuda.set_stream(stream)
     x_shape = (M, N)
     w_shape = (x_shape[-1], )
     weight = torch.rand(w_shape, dtype=dtype, device='cuda', requires_grad=True)
@@ -356,14 +368,16 @@ def bench_layer_norm(M, N, dtype, provider, mode='backward', eps=1e-5, device='c
     # forward pass
     if mode == 'forward':
         gbps = lambda ms: 2 * x.numel() * x.element_size() / ms * 1e-6
-        ms, min_ms, max_ms = triton.testing.do_bench(y_fwd, quantiles=quantiles, rep=500)
+        ms = triton.testing.do_bench_cudagraph(y_fwd)
+        # ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(y_fwd) #, quantiles=quantiles, rep=500)
     # backward pass
     if mode == 'backward':
         def gbps(ms): return 3 * x.numel() * x.element_size() / ms * 1e-6  # noqa: F811, E704
         y = y_fwd()
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: y.backward(dy, retain_graph=True),
-                                                     quantiles=quantiles, grad_to_none=[x], rep=500)
-    return gbps(ms), gbps(max_ms), gbps(min_ms)
+        ms = triton.testing.do_bench_cudagraph(lambda: y.backward(dy, retain_graph=True)) 
+        # ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(lambda: y.backward(dy, retain_graph=True)) #,
+                                                    #  quantiles=quantiles, grad_to_none=[x], rep=500)
+    return gbps(ms) #, gbps(max_ms), gbps(min_ms)
 
 
 test_layer_norm(1151, 8192, torch.float16)
