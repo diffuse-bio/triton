@@ -340,6 +340,7 @@ def vanilla_conditional_layer_norm(x, weight, bias, eps=1e-5):
 
 # @pytest.fixture
 def test_layer_norm(M, N, dtype, eps=1e-5, device='cuda'):
+    
     # create data
     x_shape = (M, N)
     w_shape = (x_shape[-1], )
@@ -397,11 +398,13 @@ def test_layer_norm(M, N, dtype, eps=1e-5, device='cuda'):
         line_names=['Triton', 'Torch'] + (['Apex'] if HAS_APEX else []),
         styles=[('blue', '-'), ('green', '-'), ('orange', '-')],
         ylabel='GB/s',
-        plot_name='layer-norm-forward',
-        args={'M': 4096, 'dtype': torch.float16, 'mode': 'forward'}
+        plot_name='layer-norm-backward',
+        args={'M': 4096, 'dtype': torch.float16, 'mode': 'backward'}
     )
 )
 def bench_layer_norm(M, N, dtype, provider, mode='backward', eps=1e-5, device='cuda'):
+    stream = torch.cuda.Stream()
+    torch.cuda.set_stream(stream)
     # create data
     x_shape = (M, N)
     w_shape = (x_shape[-1], )
@@ -424,14 +427,16 @@ def bench_layer_norm(M, N, dtype, provider, mode='backward', eps=1e-5, device='c
     # forward pass
     if mode == 'forward':
         gbps = lambda ms: 2 * x.numel() * x.element_size() / ms * 1e-6
-        ms, min_ms, max_ms = triton.testing.do_bench(y_fwd, quantiles=quantiles, rep=500)
+        ms = triton.testing.do_bench_cudagraph(y_fwd)
+        # ms, min_ms, max_ms = triton.testing.do_bench(y_fwd, quantiles=quantiles, rep=500)
     # backward pass
     if mode == 'backward':
         def gbps(ms): return 3 * x.numel() * x.element_size() / ms * 1e-6  # noqa: F811, E704
         y = y_fwd()
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: y.backward(dy, retain_graph=True),
-                                                     quantiles=quantiles, grad_to_none=[x], rep=500)
-    return gbps(ms), gbps(max_ms), gbps(min_ms)
+        ms = triton.testing.do_bench_cudagraph(lambda: y.backward(dy, retain_graph=True)) 
+        # ms, min_ms, max_ms = triton.testing.do_bench(lambda: y.backward(dy, retain_graph=True),
+                                                    #  quantiles=quantiles, grad_to_none=[x], rep=500)
+    return gbps(ms) #, gbps(max_ms), gbps(min_ms)
 
 
 test_layer_norm(1151, 8192, torch.float16)
