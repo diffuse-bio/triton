@@ -158,16 +158,23 @@ def _layer_norm_bwd_dx_fused(
     X += row * stride
     DY += row * stride
     DX += row * stride
-    # Offset locks and weights/biases gradient pointer for parallel reduction
-    lock_id = row % GROUP_SIZE_M
-    Lock += lock_id
-    Count = Lock + GROUP_SIZE_M
-    DW = DW + lock_id * N + cols
-    DB = DB + lock_id * N + cols
+    # Also map the program id to the elements of W it should compute (per-row)
+    W += row * stride
+    # 
+    if False:
+        # Offset locks and weights/biases gradient pointer for parallel reduction
+        lock_id = row % GROUP_SIZE_M
+        Lock += lock_id
+        Count = Lock + GROUP_SIZE_M
+        DW = DW + lock_id * N + cols
+        DB = DB + lock_id * N + cols
     # Load data to SRAM
     x = tl.load(X + cols, mask=mask, other=0).to(tl.float32)
     dy = tl.load(DY + cols, mask=mask, other=0).to(tl.float32)
     w = tl.load(W + cols, mask=mask).to(tl.float32)
+    # dw = tl.load(DW + cols, mask=mask).to(tl.float32)
+    # db = tl.load(DB + cols, mask=mask).to(tl.float32)
+
     mean = tl.load(Mean + row)
     rstd = tl.load(Rstd + row)
     # Compute dx
@@ -183,19 +190,27 @@ def _layer_norm_bwd_dx_fused(
     # Accumulate partial sums for dw/db
     partial_dw = (dy * xhat).to(w.dtype)
     partial_db = (dy).to(w.dtype)
-    while tl.atomic_cas(Lock, 0, 1) == 1:
-        pass
-    count = tl.load(Count)
-    # First store doesn't accumulate
-    if count == 0:
-        tl.atomic_xchg(Count, 1)
-    else:
-        partial_dw += tl.load(DW, mask=mask)
-        partial_db += tl.load(DB, mask=mask)
-    tl.store(DW, partial_dw, mask=mask)
-    tl.store(DB, partial_db, mask=mask)
-    # Release the lock
-    tl.atomic_xchg(Lock, 0)
+    
+    # partial_dw = dw + (dy * xhat).to(w.dtype)
+    # partial_db = db + (dy).to(w.dtype)
+    if False:
+        while tl.atomic_cas(Lock, 0, 1) == 1:
+            pass
+        count = tl.load(Count)
+        # First store doesn't accumulate
+        if count == 0:
+            tl.atomic_xchg(Count, 1)
+        else:
+            partial_dw += tl.load(DW, mask=mask)
+            partial_db += tl.load(DB, mask=mask)
+    # no reduction needed (no sum over batch to get grads DW and DB)
+    DW += row * stride
+    DB += row * stride
+    tl.store(DW + cols, partial_dw, mask=mask)
+    tl.store(DB + cols, partial_db, mask=mask)
+    if False:
+        # Release the lock
+        tl.atomic_xchg(Lock, 0)
 
 
 @triton.jit
@@ -212,6 +227,8 @@ def _layer_norm_bwd_dwdb(
     # Map the program id to the elements of DW and DB it should compute.
     pid = tl.program_id(0)
     cols = pid * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    # dw = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    # db = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     dw = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     db = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     # Iterate through the rows of DW and DB to sum the partial sums.
@@ -274,33 +291,45 @@ class LayerNorm(torch.autograd.Function):
         if N <= 8192: GROUP_SIZE_M = 96
         if N <= 4096: GROUP_SIZE_M = 128
         if N <= 1024: GROUP_SIZE_M = 256
-        # allocate output
-        locks = torch.zeros(2 * GROUP_SIZE_M, dtype=torch.int32, device='cuda')
-        _dw = torch.empty((GROUP_SIZE_M, w.shape[0]), dtype=x.dtype, device=w.device)
-        _db = torch.empty((GROUP_SIZE_M, w.shape[0]), dtype=x.dtype, device=w.device)
-        dw = torch.empty((w.shape[0],), dtype=w.dtype, device=w.device)
-        db = torch.empty((w.shape[0],), dtype=w.dtype, device=w.device)
+
+        # dw and db are now (M, N) instead of N
+        dw = torch.empty((w.shape[0], w.shape[1]), dtype=w.dtype, device=w.device)
+        db = torch.empty((w.shape[0], w.shape[1]), dtype=w.dtype, device=w.device)
+        if False:
+            # allocate output
+            locks = torch.zeros(2 * GROUP_SIZE_M, dtype=torch.int32, device='cuda')
+            _dw = torch.empty((GROUP_SIZE_M, w.shape[0]), dtype=x.dtype, device=w.device)
+            _db = torch.empty((GROUP_SIZE_M, w.shape[0]), dtype=x.dtype, device=w.device)
+            dw = torch.empty((w.shape[0],), dtype=w.dtype, device=w.device)
+            db = torch.empty((w.shape[0],), dtype=w.dtype, device=w.device)
         dx = torch.empty_like(dy)
         # enqueue kernel using forward pass heuristics
         # also compute partial sums for DW and DB
         x_arg = x.reshape(-1, x.shape[-1])
         M, N = x_arg.shape
-        _layer_norm_bwd_dx_fused[(M,)](dx, dy, _dw, _db, x, w, b, m, v, locks,
+        _layer_norm_bwd_dx_fused[(M,)](dx, dy, dw, db, x, w, b, m, v, None,
                                        x_arg.stride(0), N, ctx.eps,
                                        BLOCK_SIZE_N=ctx.BLOCK_SIZE,
                                        GROUP_SIZE_M=GROUP_SIZE_M,
                                        num_warps=ctx.num_warps)
-        grid = lambda meta: [triton.cdiv(N, meta['BLOCK_SIZE_N'])]
-        # accumulate partial sums in separate kernel
-        _layer_norm_bwd_dwdb[grid](_dw, _db, dw, db, GROUP_SIZE_M, N,
-                                   BLOCK_SIZE_M=32,
-                                   BLOCK_SIZE_N=128, num_ctas=1)
+        # no need to accumulate partial sums 
+        if False:
+            
+            grid = lambda meta: [triton.cdiv(N, meta['BLOCK_SIZE_N'])]
+            # accumulate partial sums in separate kernel
+            _layer_norm_bwd_dwdb[grid](_dw, _db, dw, db, GROUP_SIZE_M, N,
+                                    BLOCK_SIZE_M=32,
+                                    BLOCK_SIZE_N=128, num_ctas=1)
         return dx, None, dw, db, None
 
 
 layer_norm = LayerNorm.apply
 
 def vanilla_conditional_layer_norm(x, weight, bias, eps=1e-5):
+    # vanilla CLN --> different scale (weight) and shift (bias) params per element in batch
+    M, N = x.size()
+    assert weight.size() == x.size()
+    assert bias.size() == x.size()
     mean = torch.mean(x, -1)[..., None]
     var = torch.var(x, -1)[..., None]
     normalized_x = (x - mean) / torch.sqrt(var + eps)
@@ -328,17 +357,17 @@ def test_layer_norm(M, N, dtype, eps=1e-5, device='cuda'):
 
 
     # # backward pass (triton)
-    # y_tri.backward(dy, retain_graph=True)
-    # dx_tri, dw_tri, db_tri = [_.grad.clone() for _ in [x, weight, bias]]
-    # x.grad, weight.grad, bias.grad = None, None, None
-    # # backward pass (torch)
-    # y_ref.backward(dy, retain_graph=True)
-    # dx_ref, dw_ref, db_ref = [_.grad.clone() for _ in [x, weight, bias]]
+    y_tri.backward(dy, retain_graph=True)
+    dx_tri, dw_tri, db_tri = [_.grad.clone() for _ in [x, weight, bias]]
+    x.grad, weight.grad, bias.grad = None, None, None
+    # backward pass (torch)
+    y_ref.backward(dy, retain_graph=True)
+    dx_ref, dw_ref, db_ref = [_.grad.clone() for _ in [x, weight, bias]]
     # # compare
     # assert torch.allclose(y_tri, y_ref, atol=1e-2, rtol=0)
-    # assert torch.allclose(dx_tri, dx_ref, atol=1e-2, rtol=0)
-    # assert torch.allclose(db_tri, db_ref, atol=1e-2, rtol=0)
-    # assert torch.allclose(dw_tri, dw_ref, atol=1e-2, rtol=0)
+    assert torch.allclose(dx_tri, dx_ref, atol=1e-2, rtol=0)
+    assert torch.allclose(db_tri, db_ref, atol=1e-2, rtol=0)
+    assert torch.allclose(dw_tri, dw_ref, atol=1e-2, rtol=0)
 
 
 @triton.testing.perf_report(
@@ -388,6 +417,7 @@ def bench_layer_norm(M, N, dtype, provider, mode='backward', eps=1e-5, device='c
 
 
 test_layer_norm(1151, 8192, torch.float16)
+print('test passed')
 # bench_layer_norm.run(save_path='.', print_data=True)
 
 # %%
