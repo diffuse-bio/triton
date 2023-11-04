@@ -31,15 +31,16 @@ def _drcln_fwd_fused(
     MASK_out, # pointer to output mask after dropout
     p, # dropout prob
     seed, # dropout seed
-    # W,  # pointer to the weights
-    # B,  # pointer to the biases
-    # Mean,  # pointer to the mean
-    # Rstd,  # pointer to the 1/std
+    W,  # pointer to the weights
+    B,  # pointer to the biases
+    Mean,  # pointer to the mean
+    Rstd,  # pointer to the 1/std
     stride,  # how much to increase the pointer when moving by 1 row
     N,  # number of columns in X
-    # eps,  # epsilon to avoid division by zero
+    eps,  # epsilon to avoid division by zero
     BLOCK_SIZE: tl.constexpr,
 ):
+    
     # Map the program id to the row of X, Y, and Z it should compute.
     row = tl.program_id(0)
 
@@ -49,12 +50,14 @@ def _drcln_fwd_fused(
     Z_out += row * stride
     MASK_out += row * stride
 
-
-    # do dropout on Z
+    mean = 0
+    _mean = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    
     for off in range(0, N, BLOCK_SIZE):
         all_elem = row * stride + (off + tl.arange(0, BLOCK_SIZE))
         cols = off + tl.arange(0, BLOCK_SIZE)
         mask = cols < N
+        # do dropout on Z
         z = tl.load(Z + cols, mask=mask, other=0.).to(tl.float32)
         x = tl.load(X + cols, mask=mask, other=0.).to(tl.float32)
         random = tl.rand(seed, all_elem)
@@ -66,6 +69,33 @@ def _drcln_fwd_fused(
         res_add_output = x + output
         tl.store(MASK_out + cols, x_keep, mask=mask)
         tl.store(Z_out + cols, res_add_output, mask=mask)
+
+        # get mean of output 
+        # a = tl.load(X + cols, mask=cols < N, other=0.).to(tl.float32)
+        _mean += res_add_output
+
+    mean = tl.sum(_mean, axis=0) / N
+    _var = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    for off in range(0, N, BLOCK_SIZE):
+        cols = off + tl.arange(0, BLOCK_SIZE)
+        x = tl.load(X + cols, mask=cols < N, other=0.).to(tl.float32)
+        x = tl.where(cols < N, x - mean, 0.)
+        _var += x * x
+    var = tl.sum(_var, axis=0) / N
+    rstd = 1 / tl.sqrt(var + eps)
+    tl.store(Mean + row, mean)
+    tl.store(Rstd + row, rstd)
+    # Normalize and apply linear transformation
+    for off in range(0, N, BLOCK_SIZE):
+        cols = off + tl.arange(0, BLOCK_SIZE)
+        mask = cols < N
+        w = tl.load(W + cols, mask=mask)
+        b = tl.load(B + cols, mask=mask)
+        x = tl.load(X + cols, mask=mask, other=0.).to(tl.float32)
+        x_hat = (x - mean) * rstd
+        y = x_hat * w + b
+        # Write output
+        tl.store(Y + cols, y, mask=mask)
 
 
     # residual add 
@@ -163,12 +193,11 @@ def _drcln_bwd_dx_fused(
     dropout_mask = tl.load(DROPOUT_MASK + cols, mask=mask, other=0.).to(tl.float32)
     dz = dy * dropout_mask / (1 - p)
     tl.store(DZ + cols, dz, mask=mask)
+    # dx = dy 
     tl.store(DX + cols, dy, mask=mask)
 
     # dy = dropout(z) + x #dx  = 
     # dz = 
-    
-
 
 
     # # do dropout on Z
@@ -258,7 +287,7 @@ def _drcln_bwd_dx_fused(
 class DropoutResAddCLN(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, z, x, p=0.5, seed=42, eps=1e-5):
+    def forward(ctx, z, x, p, weight, bias, eps, seed=42):
         # z --> input ahead of dropout
         # x --> original input (residual add)
 
@@ -283,8 +312,8 @@ class DropoutResAddCLN(torch.autograd.Function):
 
 
 
-        _drcln_fwd_fused[(M,)](x_arg, y, z, z_out, mask_out, p, seed, #mean, rstd,
-                                    x_arg.stride(0), N, #eps,
+        _drcln_fwd_fused[(M,)](x_arg, y, z, z_out, mask_out, p, seed, weight, bias, mean, rstd,
+                                    x_arg.stride(0), N, eps,
                                     BLOCK_SIZE=BLOCK_SIZE, num_warps=num_warps, num_ctas=1)
         ctx.save_for_backward(mask_out, ) #x, weight, bias, mean, rstd)
         ctx.BLOCK_SIZE = BLOCK_SIZE
@@ -401,9 +430,11 @@ def test_drcln(M, N, dtype, eps=1e-5, device='cuda'):
     dy = .1 * torch.randn_like(x)
     x.requires_grad_(True)
     z.requires_grad_(True)
+
+    p = 0.5
     # forward pass
 
-    z_out_tri = dracln(z, x) #, w_shape) #, p=0.5, seed=123)
+    z_out_tri = dracln(z, x, p, weight, bias, eps) #, w_shape) #, p=0.5, seed=123)
     print(z_out_tri[0], z_out_tri[1], z_out_tri[-1])
     # print(mask_out_tri[0], mask_out_tri[1], mask_out_tri[-1])
     # y_tri = layer_norm(x, w_shape, weight, bias, eps)
