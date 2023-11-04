@@ -351,12 +351,14 @@ class DropoutResAddCLN(torch.autograd.Function):
 
 dracln = DropoutResAddCLN.apply
 
-def vanilla_conditional_drcln(z, x): #, weight, bias, eps=1e-5):
+def vanilla_conditional_drcln(z, x, weight, bias, eps): #, weight, bias, eps=1e-5):
     # vanilla CLN --> different scale (weight) and shift (bias) params per element in batch
     M, N = x.size()
     p = 0.5
     z_out = F.dropout(z, p=0.5)
-    return x + z_out
+    y =  x + z_out
+
+    return vanilla_conditional_layer_norm(y, weight, bias, eps=1e-5)
     x_keep = (torch.rand(size=(10,)) > p).to(torch.int32).cuda()
 
 
@@ -368,6 +370,19 @@ def vanilla_conditional_drcln(z, x): #, weight, bias, eps=1e-5):
 
     out = weight * normalized_x + bias
     return out
+
+def vanilla_conditional_layer_norm(x, weight, bias, eps=1e-5):
+    # vanilla CLN --> different scale (weight) and shift (bias) params per element in batch
+    M, N = x.size()
+    assert weight.size() == x.size()
+    assert bias.size() == x.size()
+    mean = torch.mean(x, -1)[..., None]
+    var = torch.var(x, -1)[..., None]
+    normalized_x = (x - mean) / torch.sqrt(var + eps)
+
+    out = weight * normalized_x + bias
+    return out
+
 
 # @pytest.fixture
 def test_drcln(M, N, dtype, eps=1e-5, device='cuda'):
@@ -391,7 +406,7 @@ def test_drcln(M, N, dtype, eps=1e-5, device='cuda'):
     print(z_out_tri[0], z_out_tri[1], z_out_tri[-1])
     # print(mask_out_tri[0], mask_out_tri[1], mask_out_tri[-1])
     # y_tri = layer_norm(x, w_shape, weight, bias, eps)
-    z_out_ref = vanilla_conditional_drcln(z, x) #, weight, bias, eps).to(dtype) #torch.nn.functional.layer_norm(x, w_shape, weight, bias, eps).to(dtype)
+    z_out_ref = vanilla_conditional_drcln(z, x, weight, bias, eps).to(dtype) #torch.nn.functional.layer_norm(x, w_shape, weight, bias, eps).to(dtype)
     # assert torch.allclose(y_tri, y_ref, atol=1e-2, rtol=0)
     print(z_out_ref[0], z_out_ref[-1])
 
@@ -413,6 +428,7 @@ def test_drcln(M, N, dtype, eps=1e-5, device='cuda'):
 
     # # assert torch.allclose(y_tri, y_ref, atol=1e-2, rtol=0)
     assert torch.allclose(dx_tri, dx_ref, atol=1e-2, rtol=0)
+    print("✅ Triton and Torch for bwd pass -- residual add")
     # assert torch.allclose(db_tri, db_ref, atol=1e-2, rtol=0)
     # assert torch.allclose(dw_tri, dw_ref, atol=1e-2, rtol=0)
     # print("✅ Triton and Torch match")
@@ -453,18 +469,19 @@ def bench_drcln(M, N, dtype, provider, mode='backward', eps=1e-5, device='cuda')
     weight = torch.rand(x_shape, dtype=dtype, device='cuda', requires_grad=True)
     bias = torch.rand(x_shape, dtype=dtype, device='cuda', requires_grad=True)
     x = -2.3 + 0.5 * torch.randn(x_shape, dtype=dtype, device='cuda')
+    z = -2.3 + 0.5 * torch.randn(x_shape, dtype=dtype, device='cuda')
     dy = .1 * torch.randn_like(x)
     x.requires_grad_(True)
+    z.requires_grad_(True)
     quantiles = [0.5, 0.2, 0.8]
     # utility functions
     if provider == 'triton':
-        def y_fwd(): return layer_norm(x, w_shape, weight, bias, eps)  # noqa: F811, E704
+        def y_fwd(): return dracln(z, x) #dracln(x, w_shape, weight, bias, eps)  # noqa: F811, E704
     if provider == 'torch':
-        def y_fwd(): return vanilla_conditional_drcln(x, weight, bias, eps)  # noqa: F811, E704
+        def y_fwd(): return vanilla_conditional_drcln(z, x) #, weight, bias, eps)  # noqa: F811, E704
     if provider == 'apex':
         apex_drcln = apex.normalization.FusedDropoutResAddCLN(
             w_shape).to(x.device).to(x.dtype)
-
         def y_fwd(): return apex_drcln(x)  # noqa: F811, E704
     # forward pass
     if mode == 'forward':
@@ -499,7 +516,7 @@ def bench_drcln(M, N, dtype, provider, mode='backward', eps=1e-5, device='cuda')
 
 
 test_drcln(1151, 10, torch.float16)
-# bench_drcln.run(save_path='.', print_data=True)
+bench_drcln.run(save_path='.', print_data=True)
 # %%
 # References
 # ----------
