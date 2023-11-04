@@ -1,14 +1,5 @@
 """
-Layer Normalization
-====================
-In this tutorial, you will write a high-performance layer normalization
-kernel that runs faster than the PyTorch implementation.
-
-In doing so, you will learn about:
-
-* Implementing backward pass in Triton.
-
-* Implementing parallel reduction in Triton.
+Updating Layer Normalization kernel for conditional layer norm
 
 """
 
@@ -353,12 +344,8 @@ def test_layer_norm(M, N, dtype, eps=1e-5, device='cuda'):
     dy = .1 * torch.randn_like(x)
     x.requires_grad_(True)
     # forward pass
-    start = time.time()
     y_tri = layer_norm(x, w_shape, weight, bias, eps)
-    print('time for triton fwd pass', time.time() - start)
-    start = time.time()
     y_ref = vanilla_conditional_layer_norm(x, weight, bias, eps).to(dtype) #torch.nn.functional.layer_norm(x, w_shape, weight, bias, eps).to(dtype)
-    print('time for torch fwd pass', time.time() - start)
     assert torch.allclose(y_tri, y_ref, atol=1e-2, rtol=0)
 
 
@@ -374,6 +361,7 @@ def test_layer_norm(M, N, dtype, eps=1e-5, device='cuda'):
     assert torch.allclose(dx_tri, dx_ref, atol=1e-2, rtol=0)
     assert torch.allclose(db_tri, db_ref, atol=1e-2, rtol=0)
     assert torch.allclose(dw_tri, dw_ref, atol=1e-2, rtol=0)
+    print("✅ Triton and Torch match")
 
 
 # @triton.testing.perf_report(
@@ -398,8 +386,8 @@ def test_layer_norm(M, N, dtype, eps=1e-5, device='cuda'):
         line_names=['Triton', 'Torch'] + (['Apex'] if HAS_APEX else []),
         styles=[('blue', '-'), ('green', '-'), ('orange', '-')],
         ylabel='GB/s',
-        plot_name='layer-norm-backward',
-        args={'M': 4096, 'dtype': torch.float16, 'mode': 'backward'}
+        plot_name='layer-norm-forward',
+        args={'M': 4096, 'dtype': torch.float16, 'mode': 'forward'}
     )
 )
 def bench_layer_norm(M, N, dtype, provider, mode='backward', eps=1e-5, device='cuda'):
@@ -440,7 +428,6 @@ def bench_layer_norm(M, N, dtype, provider, mode='backward', eps=1e-5, device='c
 
 
 test_layer_norm(1151, 8192, torch.float16)
-print('initial test passed')
 bench_layer_norm.run(save_path='.', print_data=True)
 # %%
 # References
