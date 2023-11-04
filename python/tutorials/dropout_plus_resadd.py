@@ -383,15 +383,15 @@ def test_drcln(M, N, dtype, eps=1e-5, device='cuda'):
     # # # backward pass (triton)
     z_out_tri.backward(dy, retain_graph=True)
     # dw_tri, db_tri
-    dz_tri, dx_tri  = [_.grad.clone() for _ in [z, x]] #, weight, bias]]
+    dz_tri,   = [_.grad.clone() for _ in [z, ]] #, weight, bias]]
     # print(dz_tri.size())
     print(dz_tri[0], dz_tri[1], dz_tri[-1])
     x.grad = None #, weight.grad, bias.grad = None, None, None
     # backward pass (torch)
     z_out_ref.backward(dy, retain_graph=True)
-    dz_ref, dx_ref = [_.grad.clone() for _ in [z, x]] #, weight, bias]]
+    dz_ref,  = [_.grad.clone() for _ in [z, ]] #, weight, bias]]
     # # # compare
-    print(dz_tri[0], dz_tri[1], dz_tri[-1])
+    print(dz_ref[0], dz_ref[1], dz_ref[-1])
     
     # # assert torch.allclose(y_tri, y_ref, atol=1e-2, rtol=0)
     # assert torch.allclose(dx_tri, dx_ref, atol=1e-2, rtol=0)
