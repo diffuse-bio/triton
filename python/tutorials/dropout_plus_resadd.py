@@ -19,12 +19,15 @@ except ModuleNotFoundError:
     HAS_APEX = False
 
 
+#
+# X --> [some operations] --> Z --> dropout --> Res add_x --> LN/CLN --. Y
+
 @triton.jit
 def _drcln_fwd_fused(
-    X,  # pointer to the original input
+    X,  # pointer to the original input (that will be added -- res add)
     Y,  # pointer to the output
     Z, # pointer to the input to dropout
-    Z_out, # pointer to output after dropout
+    Z_out, # pointer to output after dropout and res add
     MASK_out, # pointer to output mask after dropout
     p, # dropout prob
     seed, # dropout seed
@@ -53,14 +56,19 @@ def _drcln_fwd_fused(
         cols = off + tl.arange(0, BLOCK_SIZE)
         mask = cols < N
         z = tl.load(Z + cols, mask=mask, other=0.).to(tl.float32)
+        x = tl.load(X + cols, mask=mask, other=0.).to(tl.float32)
         random = tl.rand(seed, all_elem)
         x_keep = random > p
         # _mean += a
         output = tl.where(x_keep, z / (1 - p), 0.0)
+
+        # residual add x 
+        res_add_output = x + output
         tl.store(MASK_out + cols, x_keep, mask=mask)
-        tl.store(Z_out + cols, output, mask=mask)
+        tl.store(Z_out + cols, res_add_output, mask=mask)
 
 
+    # residual add 
 
     # # residual add Z + X
 
@@ -112,7 +120,8 @@ def _drcln_fwd_fused(
 @triton.jit
 def _drcln_bwd_dx_fused(
     DY, # pointer to output gradient
-    DZ, # pointer to input gradient
+    DZ, # pointer to input gradient (input ahead of dropout)
+    DX, # pointer input gradient (input for residual add)
     # Z, # pointer to input
     DROPOUT_MASK, # pointer to dropout mask
     p, # dropout rate
@@ -141,6 +150,7 @@ def _drcln_bwd_dx_fused(
     DROPOUT_MASK += row * stride
     DY += row * stride
     DZ += row * stride
+    DX += row * stride
 
 
     # dL/dz = DL/dy dy/dz
@@ -153,6 +163,10 @@ def _drcln_bwd_dx_fused(
     dropout_mask = tl.load(DROPOUT_MASK + cols, mask=mask, other=0.).to(tl.float32)
     dz = dy * dropout_mask / (1 - p)
     tl.store(DZ + cols, dz, mask=mask)
+    tl.store(DX + cols, dy, mask=mask)
+
+    # dy = dropout(z) + x #dx  = 
+    # dz = 
 
 
 
@@ -292,13 +306,16 @@ class DropoutResAddCLN(torch.autograd.Function):
         # x_arg = x.reshape(-1, x.shape[-1])
         # M, N = x_arg.shape
         dz = torch.empty_like(dy)
-        _drcln_bwd_dx_fused[(M,)](dy, dz,mask, ctx.p,
+        dx = torch.empty_like(dy)
+        _drcln_bwd_dx_fused[(M,)](dy, dz, dx, mask, ctx.p,
                                     dy.stride(0), N, #ctx.eps,
                                     BLOCK_SIZE_N=ctx.BLOCK_SIZE,
                                     GROUP_SIZE_M=GROUP_SIZE_M,
                                     num_warps=ctx.num_warps)
         
-        return dz, None
+    
+        
+        return dz, dx
         # # dw and db are now (M, N) instead of N
         # dw = torch.empty((w.shape[0], w.shape[1]), dtype=w.dtype, device=w.device)
         # db = torch.empty((w.shape[0], w.shape[1]), dtype=w.dtype, device=w.device)
@@ -334,12 +351,12 @@ class DropoutResAddCLN(torch.autograd.Function):
 
 dracln = DropoutResAddCLN.apply
 
-def vanilla_conditional_drcln(x): #, weight, bias, eps=1e-5):
+def vanilla_conditional_drcln(z, x): #, weight, bias, eps=1e-5):
     # vanilla CLN --> different scale (weight) and shift (bias) params per element in batch
     M, N = x.size()
     p = 0.5
-    x_out = F.dropout(x, p=0.5)
-    return x_out
+    z_out = F.dropout(z, p=0.5)
+    return x + z_out
     x_keep = (torch.rand(size=(10,)) > p).to(torch.int32).cuda()
 
 
@@ -374,7 +391,7 @@ def test_drcln(M, N, dtype, eps=1e-5, device='cuda'):
     print(z_out_tri[0], z_out_tri[1], z_out_tri[-1])
     # print(mask_out_tri[0], mask_out_tri[1], mask_out_tri[-1])
     # y_tri = layer_norm(x, w_shape, weight, bias, eps)
-    z_out_ref = vanilla_conditional_drcln(x) #, weight, bias, eps).to(dtype) #torch.nn.functional.layer_norm(x, w_shape, weight, bias, eps).to(dtype)
+    z_out_ref = vanilla_conditional_drcln(z, x) #, weight, bias, eps).to(dtype) #torch.nn.functional.layer_norm(x, w_shape, weight, bias, eps).to(dtype)
     # assert torch.allclose(y_tri, y_ref, atol=1e-2, rtol=0)
     print(z_out_ref[0], z_out_ref[-1])
 
@@ -383,18 +400,19 @@ def test_drcln(M, N, dtype, eps=1e-5, device='cuda'):
     # # # backward pass (triton)
     z_out_tri.backward(dy, retain_graph=True)
     # dw_tri, db_tri
-    dz_tri,   = [_.grad.clone() for _ in [z, ]] #, weight, bias]]
+    dz_tri, dx_tri  = [_.grad.clone() for _ in [z, x, ]] #, weight, bias]]
     # print(dz_tri.size())
     print(dz_tri[0], dz_tri[1], dz_tri[-1])
     x.grad = None #, weight.grad, bias.grad = None, None, None
     # backward pass (torch)
     z_out_ref.backward(dy, retain_graph=True)
-    dz_ref,  = [_.grad.clone() for _ in [z, ]] #, weight, bias]]
+    dz_ref, dx_ref, = [_.grad.clone() for _ in [z, x,]] #, weight, bias]]
     # # # compare
     print(dz_ref[0], dz_ref[1], dz_ref[-1])
     
+
     # # assert torch.allclose(y_tri, y_ref, atol=1e-2, rtol=0)
-    # assert torch.allclose(dx_tri, dx_ref, atol=1e-2, rtol=0)
+    assert torch.allclose(dx_tri, dx_ref, atol=1e-2, rtol=0)
     # assert torch.allclose(db_tri, db_ref, atol=1e-2, rtol=0)
     # assert torch.allclose(dw_tri, dw_ref, atol=1e-2, rtol=0)
     # print("✅ Triton and Torch match")
