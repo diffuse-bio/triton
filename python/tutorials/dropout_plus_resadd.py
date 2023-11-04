@@ -167,6 +167,7 @@ def _drcln_bwd_dx_fused(
 
     # dy = dropout(z) + x #dx  = 
     # dz = 
+    
 
 
 
@@ -351,13 +352,13 @@ class DropoutResAddCLN(torch.autograd.Function):
 
 dracln = DropoutResAddCLN.apply
 
-def vanilla_conditional_drcln(z, x, weight, bias, eps): #, weight, bias, eps=1e-5):
+def vanilla_conditional_drcln(z, x): #, weight, bias, eps): #, weight, bias, eps=1e-5):
     # vanilla CLN --> different scale (weight) and shift (bias) params per element in batch
     M, N = x.size()
     p = 0.5
     z_out = F.dropout(z, p=0.5)
     y =  x + z_out
-
+    return y
     return vanilla_conditional_layer_norm(y, weight, bias, eps=1e-5)
     x_keep = (torch.rand(size=(10,)) > p).to(torch.int32).cuda()
 
@@ -406,7 +407,7 @@ def test_drcln(M, N, dtype, eps=1e-5, device='cuda'):
     print(z_out_tri[0], z_out_tri[1], z_out_tri[-1])
     # print(mask_out_tri[0], mask_out_tri[1], mask_out_tri[-1])
     # y_tri = layer_norm(x, w_shape, weight, bias, eps)
-    z_out_ref = vanilla_conditional_drcln(z, x, weight, bias, eps).to(dtype) #torch.nn.functional.layer_norm(x, w_shape, weight, bias, eps).to(dtype)
+    z_out_ref = vanilla_conditional_drcln(z, x) #, weight, bias, eps).to(dtype) #torch.nn.functional.layer_norm(x, w_shape, weight, bias, eps).to(dtype)
     # assert torch.allclose(y_tri, y_ref, atol=1e-2, rtol=0)
     print(z_out_ref[0], z_out_ref[-1])
 
@@ -456,7 +457,7 @@ def test_drcln(M, N, dtype, eps=1e-5, device='cuda'):
         line_names=['Triton', 'Torch'] + (['Apex'] if HAS_APEX else []),
         styles=[('blue', '-'), ('green', '-'), ('orange', '-')],
         ylabel='GB/s',
-        plot_name='layer-norm-forward',
+        plot_name='dracln-forward',
         args={'M': 4096, 'dtype': torch.float16, 'mode': 'forward'}
     )
 )
