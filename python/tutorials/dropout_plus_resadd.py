@@ -56,6 +56,8 @@ def _drcln_fwd_fused(
     X += row * stride
     YIN += row * stride
     MASK_out += row * stride
+    W += row * stride
+    B += row * stride
     # RANDOM += row * stride
 
     # seed += row * seed_stride
@@ -106,8 +108,9 @@ def _drcln_fwd_fused(
         yin = tl.load(YIN + cols, mask=cols < N, other=0.).to(tl.float32)
         # x = tl.load(X + cols, mask=mask, other=0.).to(tl.float32)
         yinhat = (yin - mean) * rstd
+        # if False: # CHANGE BACK
         y = yinhat * w + b
-        # Write output
+        # Write output -- CHNAGE BACK TO Y
         tl.store(Y + cols, y, mask=mask)
 
 
@@ -211,17 +214,21 @@ def _drcln_bwd_dx_fused(
 class DropoutResAddCLN(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, z, x, p, weight, bias, eps, seed):
+    def forward(ctx, z, x, p, weight, bias, eps, seed, return_mask): #: bool = False):
         # z --> input ahead of dropout
         # x --> original input (residual add)
 
         # allocate output
+        
+        # random = torch.empty_like(z)
+        # reshape input data into 2D tensor
+        x_arg = x.reshape(-1, x.shape[-1])
+        z_arg = z.reshape(-1, x.shape[-1])
+        w_arg = weight.reshape(-1, x.shape[-1])
+        b_arg = bias.reshape(-1, x.shape[-1])
         y = torch.empty_like(x)
         yin = torch.empty_like(z)
         mask_out = torch.empty_like(z)
-        random = torch.empty_like(z)
-        # reshape input data into 2D tensor
-        x_arg = x.reshape(-1, x.shape[-1])
         M, N = x_arg.shape
 
         mean = torch.empty((M, ), dtype=torch.float32, device='cuda')
@@ -235,23 +242,28 @@ class DropoutResAddCLN(torch.autograd.Function):
         num_warps = min(max(BLOCK_SIZE // 256, 1), 8)
         # enqueue kernel
 
+        print('bias', bias)
 
-
-        _drcln_fwd_fused[(M,)](x_arg, y, z, yin, mask_out, p, seed, weight, bias, mean, rstd,
+        _drcln_fwd_fused[(M,)](x_arg, y, z_arg, yin, mask_out, p, seed, w_arg, b_arg, mean, rstd,
                                     x_arg.stride(0), N, eps, #random,
                                     BLOCK_SIZE=BLOCK_SIZE, num_warps=num_warps, num_ctas=1)
         # print("RANDOM", random, BLOCK_SIZE)
-        ctx.save_for_backward(mask_out, mean, rstd, weight, yin ) #x, weight, bias, mean, rstd)
+        ctx.save_for_backward(mask_out, mean, rstd, w_arg, yin ) #x, weight, bias, mean, rstd)
         # print('mean kernel', mean) #, 1/rstd)
         ctx.BLOCK_SIZE = BLOCK_SIZE
         ctx.num_warps = num_warps
         ctx.eps = eps
         # ctx.mask_out = mask_out
         ctx.p = p
-        return y #z_out #, mask_out
+        # if return_mask:
+        print('mean triton', mean)
+        print('rstd triton', rstd)
+        print('out y triton', y)
+        return y, mask_out
+        # return y #z_out #, mask_out
 
     @staticmethod
-    def backward(ctx, dy):
+    def backward(ctx, dy, dmask_out):
         dropout_mask, mean, rstd, weight, yin = ctx.saved_tensors
         # heuristics for amount of parallel reduction stream for DW/DB
         M, N = dy.shape #[1]
@@ -277,7 +289,7 @@ class DropoutResAddCLN(torch.autograd.Function):
         
     
         
-        return dz, dx, None, dw, db, None, None
+        return dz, dx, None, dw, db, None, None, None
         # # dw and db are now (M, N) instead of N
         # dw = torch.empty((w.shape[0], w.shape[1]), dtype=w.dtype, device=w.device)
         # db = torch.empty((w.shape[0], w.shape[1]), dtype=w.dtype, device=w.device)
@@ -313,14 +325,19 @@ class DropoutResAddCLN(torch.autograd.Function):
 
 dracln = DropoutResAddCLN.apply
 
-def vanilla_conditional_drcln(z, x, weight, bias, eps, p=0.5): #, weight, bias, eps=1e-5):
+def vanilla_conditional_drcln(z, x, weight, bias, eps, mask=None, p=0.5): #, weight, bias, eps=1e-5):
     # vanilla CLN --> different scale (weight) and shift (bias) params per element in batch
     M, N = x.size()
     p = 0.5
-    z_out = F.dropout(z, p=p)
+    if mask is None:
+        z_out = F.dropout(z, p=p)
+    else:
+        assert mask.size() == z.size()
+        z_out = z *mask/(1-p)
+    # print(z_out)
     yin =  x + z_out
-    # return y
-    return vanilla_conditional_layer_norm(yin, weight, bias, eps=1e-5)
+    # return yin
+    return vanilla_conditional_layer_norm(yin, weight, bias, eps=eps)
     x_keep = (torch.rand(size=(10,)) > p).to(torch.int32).cuda()
 
 
@@ -341,9 +358,12 @@ def vanilla_conditional_layer_norm(x, weight, bias, eps=1e-5):
     mean = torch.mean(x, -1)[..., None]
     # print('mean', mean)
     var = torch.var(x, -1)[..., None]
+    print('mean torch', mean)
+    print('rstd torch', 1/torch.sqrt(var + eps))
     normalized_x = (x - mean) / torch.sqrt(var + eps)
-
+    
     out = weight * normalized_x + bias
+    print('out torch', out)
     return out
 
 
@@ -352,7 +372,7 @@ def test_drcln(M, N, dtype, eps=1e-5, device='cuda'):
     
     # create data
     x_shape = (M, N)
-    w_shape = (x_shape[-1], )
+    # w_shape = (x_shape[-1], )
     # weight = torch.rand(w_shape, dtype=dtype, device='cuda', requires_grad=True)
     # bias = torch.rand(w_shape, dtype=dtype, device='cuda', requires_grad=True)
     # for conditional layer norm, weights and biases are (M, N) not (N, ) -- different wts/biases per row
@@ -360,7 +380,7 @@ def test_drcln(M, N, dtype, eps=1e-5, device='cuda'):
     bias = torch.rand(x_shape, dtype=dtype, device='cuda', requires_grad=True)
     x = -2.3 + 0.5 * torch.randn(x_shape, dtype=dtype, device='cuda')
     # print('x', x, x.element_size(), x.size())
-    z = -2.3 + 0.5 * torch.randn(x_shape, dtype=dtype, device='cuda')
+    z = 7+ 0.5 * torch.randn(x_shape, dtype=dtype, device='cuda')
     dy = .1 * torch.randn_like(x)
     x.requires_grad_(True)
     z.requires_grad_(True)
@@ -368,35 +388,41 @@ def test_drcln(M, N, dtype, eps=1e-5, device='cuda'):
     p = 0.5
     # forward pass
     seed = torch.randint(low=0, high=65536, size=(1,))[0].item()
-
-    z_out_tri = dracln(z, x, p, weight, bias, eps, seed) #, w_shape) #, p=0.5, seed=123)
-    print(z_out_tri[0], z_out_tri[1], z_out_tri[-1])
-    # print(mask_out_tri[0], mask_out_tri[1], mask_out_tri[-1])
+    print('bias', bias)
+    y_out_tri, mask_out_tri = dracln(z, x, p, weight, bias, eps, seed, True) #, w_shape) #, p=0.5, seed=123)
+    print('zout', y_out_tri[0], y_out_tri[1], y_out_tri[-1])
+    print('bias', bias)
+    print(mask_out_tri[0], mask_out_tri[1], mask_out_tri[-1])
     # y_tri = layer_norm(x, w_shape, weight, bias, eps)
-    z_out_ref = vanilla_conditional_drcln(z, x, weight, bias, eps).to(dtype) #torch.nn.functional.layer_norm(x, w_shape, weight, bias, eps).to(dtype)
+    print('bias', bias)
+    y_out_ref = vanilla_conditional_drcln(z, x, weight, bias, eps, mask_out_tri, p=p).to(dtype) #torch.nn.functional.layer_norm(x, w_shape, weight, bias, eps).to(dtype)
     # assert torch.allclose(y_tri, y_ref, atol=1e-2, rtol=0)
-    print(z_out_ref[0], z_out_ref[-1])
+    print('zout', y_out_ref[0], y_out_ref[-1])
+
+
+
+
 
 
 
     # # # backward pass (triton)
-    z_out_tri.backward(dy, retain_graph=True)
+    y_out_tri.backward(dy, retain_graph=True)
     # dw_tri, db_tri
     dz_tri, dx_tri, dw_tri, db_tri  = [_.grad.clone() for _ in [z, x, weight, bias, ]] #, weight, bias]]
     # print(dz_tri.size())
     print(dz_tri[0], dz_tri[1], dz_tri[-1])
     x.grad = None #, weight.grad, bias.grad = None, None, None
     # backward pass (torch)
-    z_out_ref.backward(dy, retain_graph=True)
+    y_out_ref.backward(dy, retain_graph=True)
     dz_ref, dx_ref, dw_ref, db_ref = [_.grad.clone() for _ in [z, x, weight, bias,]] #, weight, bias]]
     # # # compare
     print(dz_ref[0], dz_ref[1], dz_ref[-1])
     
 
-    # # assert torch.allclose(y_tri, y_ref, atol=1e-2, rtol=0)
-    # assert torch.allclose(dw_tri, dw_ref, atol=1e-2, rtol=0), (dw_tri, dw_ref)
-    # assert torch.allclose(db_tri, db_ref, atol=1e-2, rtol=0), (db_tri, db_ref)
-    # assert torch.allclose(dx_tri, dx_ref, atol=1e-2, rtol=0), (dx_tri, dx_ref)
+    assert torch.allclose(y_out_tri, y_out_ref, atol=1e-2, rtol=0),   (y_out_tri, y_out_ref)
+    assert torch.allclose(dw_tri, dw_ref, atol=1e-2, rtol=0), (dw_tri, dw_ref)
+    assert torch.allclose(db_tri, db_ref, atol=1e-2, rtol=0), (db_tri, db_ref)
+    assert torch.allclose(dx_tri, dx_ref, atol=1e-2, rtol=0), (dx_tri, dx_ref)
     # print("✅ Triton and Torch for bwd pass -- residual add")
     # assert torch.allclose(db_tri, db_ref, atol=1e-2, rtol=0)
     # assert torch.allclose(dw_tri, dw_ref, atol=1e-2, rtol=0)
