@@ -181,17 +181,14 @@ def _drcln_bwd_dx_fused(
     c1 = tl.sum(yin_hat * wdy, axis=0) / N
     c2 = tl.sum(wdy, axis=0) / N
     dyin = (wdy - (yin_hat * c1 + c2)) * rstd
-    # Write dx
-    # tl.store(DX + cols, dyin, mask=mask)
+    # Write dx ==  dx is just dyin (res add)
+    tl.store(DX + cols, dyin, mask=mask)
     # Accumulate partial sums for dw/db
     dw = (dy * yin_hat).to(w.dtype)
     db = (dy).to(w.dtype)
     
     tl.store(DW + cols, dw, mask=mask)
     tl.store(DB + cols, db, mask=mask)
-
-    # dx is just dyin (res add)
-    tl.store(DX + cols, dyin, mask=mask)
 
     # compute dz (dropout then add)
     dropout_mask = tl.load(DROPOUT_MASK + cols, mask=mask, other=0.).to(tl.float32)
@@ -248,7 +245,7 @@ class DropoutResAddCLN(torch.autograd.Function):
                                     x_arg.stride(0), N, eps, #random,
                                     BLOCK_SIZE=BLOCK_SIZE, num_warps=num_warps, num_ctas=1)
         # print("RANDOM", random, BLOCK_SIZE)
-        ctx.save_for_backward(mask_out, mean, rstd, w_arg, yin ) #x, weight, bias, mean, rstd)
+        ctx.save_for_backward(mask_out, mean, rstd, weight, yin ) #x, weight, bias, mean, rstd)
         # print('mean kernel', mean) #, 1/rstd)
         ctx.BLOCK_SIZE = BLOCK_SIZE
         ctx.num_warps = num_warps
@@ -272,7 +269,7 @@ class DropoutResAddCLN(torch.autograd.Function):
         if N <= 4096: GROUP_SIZE_M = 128
         if N <= 1024: GROUP_SIZE_M = 256
 
-        # x_arg = x.reshape(-1, x.shape[-1])
+        w_arg = weight.reshape(-1, weight.shape[-1])
         # M, N = x_arg.shape
         dz = torch.empty_like(dy)
         dx = torch.empty_like(dy)
@@ -281,7 +278,8 @@ class DropoutResAddCLN(torch.autograd.Function):
 
 
 
-        _drcln_bwd_dx_fused[(M,)](dy, dz, dx, yin, weight, dw, db,  mean, rstd,  dropout_mask, ctx.p,
+
+        _drcln_bwd_dx_fused[(M,)](dy, dz, dx, yin, w_arg, dw, db,  mean, rstd,  dropout_mask, ctx.p,
                                     dy.stride(0), N, #ctx.eps,
                                     BLOCK_SIZE_N=ctx.BLOCK_SIZE,
                                     GROUP_SIZE_M=GROUP_SIZE_M,
@@ -420,10 +418,11 @@ def test_drcln(M, N, dtype, eps=1e-5, device='cuda'):
     
 
     assert torch.allclose(y_out_tri, y_out_ref, atol=1e-2, rtol=0),   (y_out_tri, y_out_ref)
-    assert torch.allclose(dw_tri, dw_ref, atol=1e-2, rtol=0), (dw_tri, dw_ref)
-    assert torch.allclose(db_tri, db_ref, atol=1e-2, rtol=0), (db_tri, db_ref)
     assert torch.allclose(dx_tri, dx_ref, atol=1e-2, rtol=0), (dx_tri, dx_ref)
-    # print("✅ Triton and Torch for bwd pass -- residual add")
+    assert torch.allclose(db_tri, db_ref, atol=1e-2, rtol=0), (db_tri, db_ref)
+    assert torch.allclose(dw_tri, dw_ref, atol=1e-2, rtol=0), (dw_tri, dw_ref)
+    
+    print("✅ Triton and Torch for DRACLN")
     # assert torch.allclose(db_tri, db_ref, atol=1e-2, rtol=0)
     # assert torch.allclose(dw_tri, dw_ref, atol=1e-2, rtol=0)
     # print("✅ Triton and Torch match")
