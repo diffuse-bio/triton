@@ -38,6 +38,7 @@ def _drcln_fwd_fused(
     stride,  # how much to increase the pointer when moving by 1 row
     N,  # number of columns in X
     eps,  # epsilon to avoid division by zero
+    # RANDOM,
     BLOCK_SIZE: tl.constexpr,
 ):
     
@@ -55,6 +56,9 @@ def _drcln_fwd_fused(
     X += row * stride
     YIN += row * stride
     MASK_out += row * stride
+    # RANDOM += row * stride
+
+    # seed += row * seed_stride
 
     mean = 0
     _mean = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
@@ -67,6 +71,8 @@ def _drcln_fwd_fused(
         z = tl.load(Z + cols, mask=mask, other=0.).to(tl.float32)
         x = tl.load(X + cols, mask=mask, other=0.).to(tl.float32)
         random = tl.rand(seed, all_elem)
+        if False:
+            tl.store(RANDOM + cols, random, mask=mask)
         x_keep = random > p
         # _mean += a
         z_out = tl.where(x_keep, z / (1 - p), 0.0)
@@ -104,54 +110,6 @@ def _drcln_fwd_fused(
         # Write output
         tl.store(Y + cols, y, mask=mask)
 
-
-    # residual add 
-
-    # # residual add Z + X
-
-
-    # # CLN Z + X
-
-
-
-    # # Also map the program id to the row of W and B it should compute.
-    # W += row * stride
-    # B += row * stride
-    # # Compute mean
-    # mean = 0
-    # _mean = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-    # # print(_mean.size(), N, BLOCK_SIZE)
-    # # sum up rows
-    # for off in range(0, N, BLOCK_SIZE):
-    #     cols = off + tl.arange(0, BLOCK_SIZE)
-    #     a = tl.load(X + cols, mask=cols < N, other=0.).to(tl.float32)
-    #     _mean += a
-    # # per row mean
-    # mean = tl.sum(_mean, axis=0) / N
-    # # print(mean.size())
-    # # Compute variance -- per row
-    # _var = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-    # for off in range(0, N, BLOCK_SIZE):
-    #     cols = off + tl.arange(0, BLOCK_SIZE)
-    #     x = tl.load(X + cols, mask=cols < N, other=0.).to(tl.float32)
-    #     x = tl.where(cols < N, x - mean, 0.)
-    #     _var += x * x
-    # var = tl.sum(_var, axis=0) / N
-    # rstd = 1 / tl.sqrt(var + eps)
-    # # Write mean / rstd ( per row)
-    # tl.store(Mean + row, mean)
-    # tl.store(Rstd + row, rstd)
-    # # Normalize and apply linear transformation
-    # for off in range(0, N, BLOCK_SIZE):
-    #     cols = off + tl.arange(0, BLOCK_SIZE)
-    #     mask = cols < N
-    #     w = tl.load(W + cols, mask=mask)
-    #     b = tl.load(B + cols, mask=mask)
-    #     x = tl.load(X + cols, mask=mask, other=0.).to(tl.float32)
-    #     x_hat = (x - mean) * rstd
-    #     y = x_hat * w + b
-    #     # Write output
-    #     tl.store(Y + cols, y, mask=mask)
 
 
 @triton.jit
@@ -239,110 +197,6 @@ def _drcln_bwd_dx_fused(
 
 
 
-    # # Z += row * stride
-    
-    # DY += row * stride
-    
-    
-    # Z_OUT += row * stride
-
-    # z_out = tl.load(Z_OUT + cols, mask=mask, other=0).to(tl.float32)
-    # dy = tl.load(DY + cols, mask=mask, other=0).to(tl.float32)
-    # w = tl.load(W + cols, mask=mask).to(tl.float32)
-    # # dz = dln * mask * z / (1 - p)
-    # # dx = dln
-
-
-    # # dL/dz = DL/dy dy/dz
-    # # z_out = mask * z / (1 - p)
-    # # gradient is  dz = dy * mask / (1 - p)
-    # # for off in range(0, N, BLOCK_SIZE):
-    # cols = tl.arange(0, BLOCK_SIZE_N)
-    # mask = cols < N
-    # dy = tl.load(DY + cols, mask=mask, other=0).to(tl.float32)
-    # dropout_mask = tl.load(DROPOUT_MASK + cols, mask=mask, other=0.).to(tl.float32)
-    # dz = dy * dropout_mask / (1 - p)
-    # tl.store(DZ + cols, dz, mask=mask)
-    # # dx = dy 
-    
-
-    # dy = dropout(z) + x #dx  = 
-    # dz = 
-
-
-    # # do dropout on Z
-    # for off in range(0, N, BLOCK_SIZE):
-    #     all_elem = row * stride + (off + tl.arange(0, BLOCK_SIZE))
-    #     cols = off + tl.arange(0, BLOCK_SIZE)
-    #     mask = cols < N
-    #     z = tl.load(Z + cols, mask=mask, other=0.).to(tl.float32)
-    #     random = tl.rand(seed, all_elem)
-    #     x_keep = random > p
-    #     # _mean += a
-    #     output = tl.where(x_keep, z / (1 - p), 0.0)
-    #     tl.store(MASK_out + cols, x_keep, mask=mask)
-    #     tl.store(Z_out + cols, output, mask=mask)
-
-
-
-    # X += row * stride
-    # DY += row * stride
-    # DZ += row * stride
-
-
-    # # Also map the program id to the elements of W it should compute (per-row)
-    # W += row * stride
-    # # 
-    # if False:
-    #     # Offset locks and weights/biases gradient pointer for parallel reduction
-    #     lock_id = row % GROUP_SIZE_M
-    #     Lock += lock_id
-    #     Count = Lock + GROUP_SIZE_M
-    #     DW = DW + lock_id * N + cols
-    #     DB = DB + lock_id * N + cols
-    # # Load data to SRAM
-    # x = tl.load(X + cols, mask=mask, other=0).to(tl.float32)
-    # dy = tl.load(DY + cols, mask=mask, other=0).to(tl.float32)
-    # w = tl.load(W + cols, mask=mask).to(tl.float32)
-    # # dw = tl.load(DW + cols, mask=mask).to(tl.float32)
-    # # db = tl.load(DB + cols, mask=mask).to(tl.float32)
-
-    # mean = tl.load(Mean + row)
-    # rstd = tl.load(Rstd + row)
-    # # Compute dx
-    # xhat = (x - mean) * rstd
-    # wdy = w * dy
-    # xhat = tl.where(mask, xhat, 0.)
-    # wdy = tl.where(mask, wdy, 0.)
-    # c1 = tl.sum(xhat * wdy, axis=0) / N
-    # c2 = tl.sum(wdy, axis=0) / N
-    # dx = (wdy - (xhat * c1 + c2)) * rstd
-    # # Write dx
-    # tl.store(DX + cols, dx, mask=mask)
-    # # Accumulate partial sums for dw/db
-    # partial_dw = (dy * xhat).to(w.dtype)
-    # partial_db = (dy).to(w.dtype)
-    
-    # # partial_dw = dw + (dy * xhat).to(w.dtype)
-    # # partial_db = db + (dy).to(w.dtype)
-    # if False:
-    #     while tl.atomic_cas(Lock, 0, 1) == 1:
-    #         pass
-    #     count = tl.load(Count)
-    #     # First store doesn't accumulate
-    #     if count == 0:
-    #         tl.atomic_xchg(Count, 1)
-    #     else:
-    #         partial_dw += tl.load(DW, mask=mask)
-    #         partial_db += tl.load(DB, mask=mask)
-    # # no reduction needed (no sum over batch to get grads DW and DB)
-    # DW += row * stride
-    # DB += row * stride
-    # tl.store(DW + cols, partial_dw, mask=mask)
-    # tl.store(DB + cols, partial_db, mask=mask)
-    # if False:
-    #     # Release the lock
-    #     tl.atomic_xchg(Lock, 0)
 
 
 # %%
@@ -357,7 +211,7 @@ def _drcln_bwd_dx_fused(
 class DropoutResAddCLN(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, z, x, p, weight, bias, eps, seed=42):
+    def forward(ctx, z, x, p, weight, bias, eps, seed):
         # z --> input ahead of dropout
         # x --> original input (residual add)
 
@@ -365,6 +219,7 @@ class DropoutResAddCLN(torch.autograd.Function):
         y = torch.empty_like(x)
         yin = torch.empty_like(z)
         mask_out = torch.empty_like(z)
+        random = torch.empty_like(z)
         # reshape input data into 2D tensor
         x_arg = x.reshape(-1, x.shape[-1])
         M, N = x_arg.shape
@@ -383,8 +238,9 @@ class DropoutResAddCLN(torch.autograd.Function):
 
 
         _drcln_fwd_fused[(M,)](x_arg, y, z, yin, mask_out, p, seed, weight, bias, mean, rstd,
-                                    x_arg.stride(0), N, eps,
+                                    x_arg.stride(0), N, eps, #random,
                                     BLOCK_SIZE=BLOCK_SIZE, num_warps=num_warps, num_ctas=1)
+        # print("RANDOM", random, BLOCK_SIZE)
         ctx.save_for_backward(mask_out, mean, rstd, weight, yin ) #x, weight, bias, mean, rstd)
         # print('mean kernel', mean) #, 1/rstd)
         ctx.BLOCK_SIZE = BLOCK_SIZE
@@ -421,7 +277,7 @@ class DropoutResAddCLN(torch.autograd.Function):
         
     
         
-        return dz, dx, None, dw, db, None
+        return dz, dx, None, dw, db, None, None
         # # dw and db are now (M, N) instead of N
         # dw = torch.empty((w.shape[0], w.shape[1]), dtype=w.dtype, device=w.device)
         # db = torch.empty((w.shape[0], w.shape[1]), dtype=w.dtype, device=w.device)
@@ -503,6 +359,7 @@ def test_drcln(M, N, dtype, eps=1e-5, device='cuda'):
     weight = torch.rand(x_shape, dtype=dtype, device='cuda', requires_grad=True)
     bias = torch.rand(x_shape, dtype=dtype, device='cuda', requires_grad=True)
     x = -2.3 + 0.5 * torch.randn(x_shape, dtype=dtype, device='cuda')
+    # print('x', x, x.element_size(), x.size())
     z = -2.3 + 0.5 * torch.randn(x_shape, dtype=dtype, device='cuda')
     dy = .1 * torch.randn_like(x)
     x.requires_grad_(True)
@@ -510,8 +367,9 @@ def test_drcln(M, N, dtype, eps=1e-5, device='cuda'):
 
     p = 0.5
     # forward pass
+    seed = torch.randint(low=0, high=65536, size=(1,))[0].item()
 
-    z_out_tri = dracln(z, x, p, weight, bias, eps) #, w_shape) #, p=0.5, seed=123)
+    z_out_tri = dracln(z, x, p, weight, bias, eps, seed) #, w_shape) #, p=0.5, seed=123)
     print(z_out_tri[0], z_out_tri[1], z_out_tri[-1])
     # print(mask_out_tri[0], mask_out_tri[1], mask_out_tri[-1])
     # y_tri = layer_norm(x, w_shape, weight, bias, eps)
@@ -580,16 +438,18 @@ def bench_drcln(M, N, dtype, provider, mode='backward', eps=1e-5, device='cuda')
     weight = torch.rand(x_shape, dtype=dtype, device='cuda', requires_grad=True)
     bias = torch.rand(x_shape, dtype=dtype, device='cuda', requires_grad=True)
     x = -2.3 + 0.5 * torch.randn(x_shape, dtype=dtype, device='cuda')
+    
     z = -2.3 + 0.5 * torch.randn(x_shape, dtype=dtype, device='cuda')
     dy = .1 * torch.randn_like(x)
     x.requires_grad_(True)
     z.requires_grad_(True)
     quantiles = [0.5, 0.2, 0.8]
     p = 0.5
+    seed = torch.randint(low=0, high=65536, size=(1,))[0].item()
     # utility functions
     if provider == 'triton':
         #  z, x, p, weight, bias, eps,
-        def y_fwd(): return dracln(z, x, p, weight, bias, eps) #dracln(x, w_shape, weight, bias, eps)  # noqa: F811, E704
+        def y_fwd(): return dracln(z, x, p, weight, bias, eps, seed) #dracln(x, w_shape, weight, bias, eps)  # noqa: F811, E704
     if provider == 'torch':
         def y_fwd(): return vanilla_conditional_drcln(z, x, weight, bias, eps, p=p)  # noqa: F811, E704
     if provider == 'apex':
@@ -614,24 +474,6 @@ def bench_drcln(M, N, dtype, provider, mode='backward', eps=1e-5, device='cuda')
 
 
 
-# x = torch.randn(size=(10, 20,)).cuda()
-# # Compare this to the baseline - dropout mask is never instantiated!
-# output = seeded_dropout(x, p=0.5, seed=123)
-# output2 = seeded_dropout(x, p=0.5, seed=123)
-# output3 = seeded_dropout(x, p=0.5, seed=512)
 
-# print(tabulate.tabulate([
-#     ["input"] + x.tolist(),
-#     ["output (seed = 123)"] + output.tolist(),
-#     ["output (seed = 123)"] + output2.tolist(),
-#     ["output (seed = 512)"] + output3.tolist()
-# ]))
-
-
-test_drcln(1151, 10, torch.float16)
+test_drcln(1151, 8195, torch.float16)
 bench_drcln.run(save_path='.', print_data=True)
-# %%
-# References
-# ----------
-#
-# .. [BA2016] Jimmy Lei Ba and Jamie Ryan Kiros and Geoffrey E. Hinton, "Layer Normalization", Arxiv 2016

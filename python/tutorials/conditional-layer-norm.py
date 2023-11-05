@@ -386,7 +386,7 @@ def test_layer_norm(M, N, dtype, eps=1e-5, device='cuda'):
         line_names=['Triton', 'Torch'] + (['Apex'] if HAS_APEX else []),
         styles=[('blue', '-'), ('green', '-'), ('orange', '-')],
         ylabel='GB/s',
-        plot_name='layer-norm-forward',
+        plot_name='conditional-layer-norm-forward',
         args={'M': 4096, 'dtype': torch.float16, 'mode': 'forward'}
     )
 )
