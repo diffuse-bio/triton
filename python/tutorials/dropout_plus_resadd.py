@@ -369,7 +369,7 @@ def bench_drcln(M, N, dtype, provider, mode='backward', eps=1e-5, device='cuda')
     dy = .1 * torch.randn_like(x)
     x.requires_grad_(True)
     z.requires_grad_(True)
-    quantiles = [0.5, 0.2, 0.8]
+    # quantiles = [0.5, 0.2, 0.8]
     p = 0.5
     seed = torch.randint(low=0, high=65536, size=(1,))[0].item()
     # utility functions
