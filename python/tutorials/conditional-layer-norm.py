@@ -1,14 +1,5 @@
 """
-Layer Normalization
-====================
-In this tutorial, you will write a high-performance layer normalization
-kernel that runs faster than the PyTorch implementation.
-
-In doing so, you will learn about:
-
-* Implementing backward pass in Triton.
-
-* Implementing parallel reduction in Triton.
+Updating Layer Normalization kernel for conditional layer norm
 
 """
 
@@ -61,15 +52,22 @@ def _layer_norm_fwd_fused(
     row = tl.program_id(0)
     Y += row * stride
     X += row * stride
+    # Also map the program id to the row of W and B it should compute.
+    W += row * stride
+    B += row * stride
     # Compute mean
     mean = 0
     _mean = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    # print(_mean.size(), N, BLOCK_SIZE)
+    # sum up rows
     for off in range(0, N, BLOCK_SIZE):
         cols = off + tl.arange(0, BLOCK_SIZE)
         a = tl.load(X + cols, mask=cols < N, other=0.).to(tl.float32)
         _mean += a
+    # per row mean
     mean = tl.sum(_mean, axis=0) / N
-    # Compute variance
+    # print(mean.size())
+    # Compute variance -- per row
     _var = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
     for off in range(0, N, BLOCK_SIZE):
         cols = off + tl.arange(0, BLOCK_SIZE)
@@ -78,7 +76,7 @@ def _layer_norm_fwd_fused(
         _var += x * x
     var = tl.sum(_var, axis=0) / N
     rstd = 1 / tl.sqrt(var + eps)
-    # Write mean / rstd
+    # Write mean / rstd ( per row)
     tl.store(Mean + row, mean)
     tl.store(Rstd + row, rstd)
     # Normalize and apply linear transformation
@@ -152,16 +150,23 @@ def _layer_norm_bwd_dx_fused(
     X += row * stride
     DY += row * stride
     DX += row * stride
-    # Offset locks and weights/biases gradient pointer for parallel reduction
-    lock_id = row % GROUP_SIZE_M
-    Lock += lock_id
-    Count = Lock + GROUP_SIZE_M
-    DW = DW + lock_id * N + cols
-    DB = DB + lock_id * N + cols
+    # Also map the program id to the elements of W it should compute (per-row)
+    W += row * stride
+    # 
+    if False:
+        # Offset locks and weights/biases gradient pointer for parallel reduction
+        lock_id = row % GROUP_SIZE_M
+        Lock += lock_id
+        Count = Lock + GROUP_SIZE_M
+        DW = DW + lock_id * N + cols
+        DB = DB + lock_id * N + cols
     # Load data to SRAM
     x = tl.load(X + cols, mask=mask, other=0).to(tl.float32)
     dy = tl.load(DY + cols, mask=mask, other=0).to(tl.float32)
     w = tl.load(W + cols, mask=mask).to(tl.float32)
+    # dw = tl.load(DW + cols, mask=mask).to(tl.float32)
+    # db = tl.load(DB + cols, mask=mask).to(tl.float32)
+
     mean = tl.load(Mean + row)
     rstd = tl.load(Rstd + row)
     # Compute dx
@@ -177,19 +182,27 @@ def _layer_norm_bwd_dx_fused(
     # Accumulate partial sums for dw/db
     partial_dw = (dy * xhat).to(w.dtype)
     partial_db = (dy).to(w.dtype)
-    while tl.atomic_cas(Lock, 0, 1) == 1:
-        pass
-    count = tl.load(Count)
-    # First store doesn't accumulate
-    if count == 0:
-        tl.atomic_xchg(Count, 1)
-    else:
-        partial_dw += tl.load(DW, mask=mask)
-        partial_db += tl.load(DB, mask=mask)
-    tl.store(DW, partial_dw, mask=mask)
-    tl.store(DB, partial_db, mask=mask)
-    # Release the lock
-    tl.atomic_xchg(Lock, 0)
+    
+    # partial_dw = dw + (dy * xhat).to(w.dtype)
+    # partial_db = db + (dy).to(w.dtype)
+    if False:
+        while tl.atomic_cas(Lock, 0, 1) == 1:
+            pass
+        count = tl.load(Count)
+        # First store doesn't accumulate
+        if count == 0:
+            tl.atomic_xchg(Count, 1)
+        else:
+            partial_dw += tl.load(DW, mask=mask)
+            partial_db += tl.load(DB, mask=mask)
+    # no reduction needed (no sum over batch to get grads DW and DB)
+    DW += row * stride
+    DB += row * stride
+    tl.store(DW + cols, partial_dw, mask=mask)
+    tl.store(DB + cols, partial_db, mask=mask)
+    if False:
+        # Release the lock
+        tl.atomic_xchg(Lock, 0)
 
 
 @triton.jit
@@ -206,6 +219,8 @@ def _layer_norm_bwd_dwdb(
     # Map the program id to the elements of DW and DB it should compute.
     pid = tl.program_id(0)
     cols = pid * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    # dw = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    # db = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     dw = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     db = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     # Iterate through the rows of DW and DB to sum the partial sums.
@@ -268,68 +283,100 @@ class LayerNorm(torch.autograd.Function):
         if N <= 8192: GROUP_SIZE_M = 96
         if N <= 4096: GROUP_SIZE_M = 128
         if N <= 1024: GROUP_SIZE_M = 256
-        # allocate output
-        locks = torch.zeros(2 * GROUP_SIZE_M, dtype=torch.int32, device='cuda')
-        _dw = torch.empty((GROUP_SIZE_M, w.shape[0]), dtype=x.dtype, device=w.device)
-        _db = torch.empty((GROUP_SIZE_M, w.shape[0]), dtype=x.dtype, device=w.device)
-        dw = torch.empty((w.shape[0],), dtype=w.dtype, device=w.device)
-        db = torch.empty((w.shape[0],), dtype=w.dtype, device=w.device)
+
+        # dw and db are now (M, N) instead of N
+        dw = torch.empty((w.shape[0], w.shape[1]), dtype=w.dtype, device=w.device)
+        db = torch.empty((w.shape[0], w.shape[1]), dtype=w.dtype, device=w.device)
+        if False:
+            # allocate output
+            locks = torch.zeros(2 * GROUP_SIZE_M, dtype=torch.int32, device='cuda')
+            _dw = torch.empty((GROUP_SIZE_M, w.shape[0]), dtype=x.dtype, device=w.device)
+            _db = torch.empty((GROUP_SIZE_M, w.shape[0]), dtype=x.dtype, device=w.device)
+            dw = torch.empty((w.shape[0],), dtype=w.dtype, device=w.device)
+            db = torch.empty((w.shape[0],), dtype=w.dtype, device=w.device)
         dx = torch.empty_like(dy)
         # enqueue kernel using forward pass heuristics
         # also compute partial sums for DW and DB
         x_arg = x.reshape(-1, x.shape[-1])
         M, N = x_arg.shape
-        _layer_norm_bwd_dx_fused[(M,)](dx, dy, _dw, _db, x, w, b, m, v, locks,
+        _layer_norm_bwd_dx_fused[(M,)](dx, dy, dw, db, x, w, b, m, v, None,
                                        x_arg.stride(0), N, ctx.eps,
                                        BLOCK_SIZE_N=ctx.BLOCK_SIZE,
                                        GROUP_SIZE_M=GROUP_SIZE_M,
                                        num_warps=ctx.num_warps)
-        grid = lambda meta: [triton.cdiv(N, meta['BLOCK_SIZE_N'])]
-        # accumulate partial sums in separate kernel
-        _layer_norm_bwd_dwdb[grid](_dw, _db, dw, db, GROUP_SIZE_M, N,
-                                   BLOCK_SIZE_M=32,
-                                   BLOCK_SIZE_N=128, num_ctas=1)
+        # no need to accumulate partial sums 
+        if False:
+            
+            grid = lambda meta: [triton.cdiv(N, meta['BLOCK_SIZE_N'])]
+            # accumulate partial sums in separate kernel
+            _layer_norm_bwd_dwdb[grid](_dw, _db, dw, db, GROUP_SIZE_M, N,
+                                    BLOCK_SIZE_M=32,
+                                    BLOCK_SIZE_N=128, num_ctas=1)
         return dx, None, dw, db, None
 
 
 layer_norm = LayerNorm.apply
 
+def vanilla_conditional_layer_norm(x, weight, bias, eps=1e-5):
+    # vanilla CLN --> different scale (weight) and shift (bias) params per element in batch
+    M, N = x.size()
+    assert weight.size() == x.size()
+    assert bias.size() == x.size()
+    mean = torch.mean(x, -1)[..., None]
+    var = torch.var(x, -1)[..., None]
+    normalized_x = (x - mean) / torch.sqrt(var + eps)
 
+    out = weight * normalized_x + bias
+    return out
+
+# @pytest.fixture
 def test_layer_norm(M, N, dtype, eps=1e-5, device='cuda'):
-
+    
     # create data
     x_shape = (M, N)
     w_shape = (x_shape[-1], )
-    weight = torch.rand(w_shape, dtype=dtype, device='cuda', requires_grad=True)
-    bias = torch.rand(w_shape, dtype=dtype, device='cuda', requires_grad=True)
+    # weight = torch.rand(w_shape, dtype=dtype, device='cuda', requires_grad=True)
+    # bias = torch.rand(w_shape, dtype=dtype, device='cuda', requires_grad=True)
+    # for conditional layer norm, weights and biases are (M, N) not (N, ) -- different wts/biases per row
+    weight = torch.rand(x_shape, dtype=dtype, device='cuda', requires_grad=True)
+    bias = torch.rand(x_shape, dtype=dtype, device='cuda', requires_grad=True)
     x = -2.3 + 0.5 * torch.randn(x_shape, dtype=dtype, device='cuda')
     dy = .1 * torch.randn_like(x)
     x.requires_grad_(True)
     # forward pass
-    start = time.time()
     y_tri = layer_norm(x, w_shape, weight, bias, eps)
-    print('time for triton fwd pass', time.time() - start)
-    start = time.time()
-    y_ref = torch.nn.functional.layer_norm(x, w_shape, weight, bias, eps).to(dtype)
-    print('time for torch fwd pass', time.time() - start)
-    # backward pass (triton)
-    start = time.time()
+    y_ref = vanilla_conditional_layer_norm(x, weight, bias, eps).to(dtype) #torch.nn.functional.layer_norm(x, w_shape, weight, bias, eps).to(dtype)
+    assert torch.allclose(y_tri, y_ref, atol=1e-2, rtol=0)
+
+
+    # # backward pass (triton)
     y_tri.backward(dy, retain_graph=True)
-    print('time for triton bwd pass', time.time() - start)
     dx_tri, dw_tri, db_tri = [_.grad.clone() for _ in [x, weight, bias]]
     x.grad, weight.grad, bias.grad = None, None, None
     # backward pass (torch)
-    start = time.time()
     y_ref.backward(dy, retain_graph=True)
-    print('time for torch bwd pass', time.time() - start)
     dx_ref, dw_ref, db_ref = [_.grad.clone() for _ in [x, weight, bias]]
-    # compare
-    assert torch.allclose(y_tri, y_ref, atol=1e-2, rtol=0)
+    # # compare
+    # assert torch.allclose(y_tri, y_ref, atol=1e-2, rtol=0)
     assert torch.allclose(dx_tri, dx_ref, atol=1e-2, rtol=0)
     assert torch.allclose(db_tri, db_ref, atol=1e-2, rtol=0)
     assert torch.allclose(dw_tri, dw_ref, atol=1e-2, rtol=0)
+    print("✅ Triton and Torch match")
 
 
+# @triton.testing.perf_report(
+#     triton.testing.Benchmark(
+#         x_names=['N'],
+#         x_vals=[512 * i for i in range(2, 32)],
+#         line_arg='provider',
+#         line_vals=['triton', 'torch'] + (['apex'] if HAS_APEX else []),
+#         line_names=['Triton', 'Torch'] + (['Apex'] if HAS_APEX else []),
+#         styles=[('blue', '-'), ('green', '-'), ('orange', '-')],
+#         ylabel='GB/s',
+#         plot_name='layer-norm-backward',
+#         args={'M': 4096, 'dtype': torch.float16, 'mode': 'backward'}
+#     )
+# )
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=['N'],
@@ -339,18 +386,18 @@ def test_layer_norm(M, N, dtype, eps=1e-5, device='cuda'):
         line_names=['Triton', 'Torch'] + (['Apex'] if HAS_APEX else []),
         styles=[('blue', '-'), ('green', '-'), ('orange', '-')],
         ylabel='GB/s',
-        plot_name='layer-norm-backward',
-        args={'M': 4096, 'dtype': torch.float16, 'mode': 'backward'}
+        plot_name='conditional-layer-norm-forward',
+        args={'M': 4096, 'dtype': torch.float16, 'mode': 'forward'}
     )
 )
 def bench_layer_norm(M, N, dtype, provider, mode='backward', eps=1e-5, device='cuda'):
-    # create data
     stream = torch.cuda.Stream()
     torch.cuda.set_stream(stream)
+    # create data
     x_shape = (M, N)
     w_shape = (x_shape[-1], )
-    weight = torch.rand(w_shape, dtype=dtype, device='cuda', requires_grad=True)
-    bias = torch.rand(w_shape, dtype=dtype, device='cuda', requires_grad=True)
+    weight = torch.rand(x_shape, dtype=dtype, device='cuda', requires_grad=True)
+    bias = torch.rand(x_shape, dtype=dtype, device='cuda', requires_grad=True)
     x = -2.3 + 0.5 * torch.randn(x_shape, dtype=dtype, device='cuda')
     dy = .1 * torch.randn_like(x)
     x.requires_grad_(True)
@@ -359,7 +406,7 @@ def bench_layer_norm(M, N, dtype, provider, mode='backward', eps=1e-5, device='c
     if provider == 'triton':
         def y_fwd(): return layer_norm(x, w_shape, weight, bias, eps)  # noqa: F811, E704
     if provider == 'torch':
-        def y_fwd(): return torch.nn.functional.layer_norm(x, w_shape, weight, bias, eps)  # noqa: F811, E704
+        def y_fwd(): return vanilla_conditional_layer_norm(x, weight, bias, eps)  # noqa: F811, E704
     if provider == 'apex':
         apex_layer_norm = apex.normalization.FusedLayerNorm(
             w_shape).to(x.device).to(x.dtype)
@@ -369,20 +416,19 @@ def bench_layer_norm(M, N, dtype, provider, mode='backward', eps=1e-5, device='c
     if mode == 'forward':
         gbps = lambda ms: 2 * x.numel() * x.element_size() / ms * 1e-6
         ms = triton.testing.do_bench_cudagraph(y_fwd)
-        # ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(y_fwd) #, quantiles=quantiles, rep=500)
+        # ms, min_ms, max_ms = triton.testing.do_bench(y_fwd, quantiles=quantiles, rep=500)
     # backward pass
     if mode == 'backward':
         def gbps(ms): return 3 * x.numel() * x.element_size() / ms * 1e-6  # noqa: F811, E704
         y = y_fwd()
         ms = triton.testing.do_bench_cudagraph(lambda: y.backward(dy, retain_graph=True)) 
-        # ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(lambda: y.backward(dy, retain_graph=True)) #,
+        # ms, min_ms, max_ms = triton.testing.do_bench(lambda: y.backward(dy, retain_graph=True),
                                                     #  quantiles=quantiles, grad_to_none=[x], rep=500)
     return gbps(ms) #, gbps(max_ms), gbps(min_ms)
 
 
 test_layer_norm(1151, 8192, torch.float16)
 bench_layer_norm.run(save_path='.', print_data=True)
-
 # %%
 # References
 # ----------

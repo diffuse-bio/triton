@@ -147,7 +147,7 @@ output3 = seeded_dropout(x, p=0.5, seed=512)
 
 print(tabulate.tabulate([
     ["input"] + x.tolist(),
-    ["output (seed = 123)"] + output.tolist(),
+    ["output (seed = 123)"] + output2.tolist(),
     ["output (seed = 123)"] + output2.tolist(),
     ["output (seed = 512)"] + output3.tolist()
 ]))
