@@ -1,10 +1,13 @@
 from typing import List
 from typing import Tuple
+import numpy.typing as npt
 import itertools as it
 
 import modal
 import numpy as np
 import scipy.special as sp
+import matplotlib.pyplot as plt
+import pickle as pkl
 
 model_volume = modal.Volume.persisted("esm-model-cache-vol-new")
 torch_image = modal.Image.from_registry(
@@ -25,7 +28,7 @@ def get_esm_target_bind_prob_score(sequences: List[str], batch_size :int = 4):
     import numpy as np
     import scipy.special as sp
     import torch
-    import matplotlib.pyplot as plt
+    
 
     model, alphabet = torch.hub.load("facebookresearch/esm:main", "esm2_t33_650M_UR50D")
     model.eval()
@@ -38,6 +41,8 @@ def get_esm_target_bind_prob_score(sequences: List[str], batch_size :int = 4):
     ]
 
     sum_log_probs_score: List[float] = []
+    inter_contact_regions: List[npt.NDArray[Any]] = []
+
     for seq_batch in sequence_batches:
         
         data = [("linked_seq", seq[0]) for seq in seq_batch]
@@ -72,8 +77,11 @@ def get_esm_target_bind_prob_score(sequences: List[str], batch_size :int = 4):
             #inter_contact_region_bot_left = torch.zeros((peptide_length, target_prot_length), dtype=torch.float32) # symmetry assumed.
 
             #save as an image - verify the contact map. Need the right naming label to return the contact images as an array
-            inter_contact_region_top_right[ : , : ] = results["contacts"][b_idx, : target_prot_length, -peptide_length:]
+            pep_start_idx = target_prot_length + linker_length  # contact maps are tripped. (does not include start/end tokens)
+            inter_contact_region_top_right[ : , : ] = results["contacts"][b_idx, : target_prot_length, pep_start_idx : pep_start_idx+peptide_length]
 
+            # Modal execution model would help - converting torch tensor to nd array
+            inter_contact_regions.append(inter_contact_region_top_right.numpy())
             # we need to figure out the intra-residue contact in the peptide. Remove the interal contact peptide from the score
             
             # the logits for all indices in the above region indicate inter-contact between protein and peptide.
@@ -92,14 +100,11 @@ def get_esm_target_bind_prob_score(sequences: List[str], batch_size :int = 4):
  
             sum_log_probs_score.append(av_log_prob)
 
+    return inter_contact_regions
+    #return sum_log_probs_score
 
-    return sum_log_probs_score
 
 
-
-    # following does not need a GPU, but I need to figure out how to call a CPU computation from GPU
-
-    # need to keep track of the target_prot_end_index, binder_start_index for each sequence in the batch
 
 def compute_esm_bind_aff_score_parallel(
     sequences: List[Tuple [str, List[int]]], num_workers: int = 2, batch_size_per_worker: int = 2
@@ -113,7 +118,8 @@ def compute_esm_bind_aff_score_parallel(
     ]
     args = [(worker_seqs, batch_size_per_worker) for worker_seqs in worker_split]
     
-    return np.concatenate(list(get_esm_target_bind_prob_score.starmap(args)))
+    return list(get_esm_target_bind_prob_score.starmap(args))
+    #return np.concatenate(list(get_esm_target_bind_prob_score.starmap(args)))
 
 ## following not yet integrated.
 
@@ -197,8 +203,27 @@ def main():
         it.islice(it.chain.from_iterable(it.repeat(sequences)), 4)
     )
 
-    contact_scores  = compute_esm_bind_aff_score_parallel(test_sequences)
-    print (contact_scores)
-    
 
+    contact_regions  = compute_esm_bind_aff_score_parallel(test_sequences)
+
+    #print (type(contact_regions[0][0]))
+    #print (type(contact_regions[0]))
+
+    #print (contact_regions[0][1].shape())
+    #print (contact_scores)
+
+    np.save("pep1", contact_regions[0][0])
+    np.save("pep2", contact_regions[0][1])
+    
+    fig, ax = plt.subplots()
+    ax1 = plt.subplot(221)
+    fig.suptitle ("Contact regions between Target Protein and Peptide")
+    im1 = ax1.imshow(contact_regions[0][0], cmap='hot')
+    plt.colorbar(im1, ax=ax1)
+    ax2 = plt.subplot(222)
+    im2 = ax2.imshow(contact_regions[0][1], cmap='hot')
+    plt.colorbar(im2, ax=ax2)
+
+    plt.show()
+    
 
