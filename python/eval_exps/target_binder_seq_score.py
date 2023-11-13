@@ -17,6 +17,7 @@ torch_image = modal.Image.from_registry(
 
 stub = modal.Stub("ESM2-binder-eval")
 
+# IMPORTANT NOTE - uses AI00 - for shorter sequences (less than 750 AA) please change to T4. 
 @stub.function(
     gpu="A100",
     image=torch_image,
@@ -102,8 +103,6 @@ def get_esm_target_bind_prob_score(sequences: List[str], batch_size :int = 4):
 
     return inter_contact_regions
     #return sum_log_probs_score
-
-
 
 
 def compute_esm_bind_aff_score_parallel(
@@ -206,11 +205,7 @@ def main():
 
     contact_regions  = compute_esm_bind_aff_score_parallel(test_sequences)
 
-    #print (type(contact_regions[0][0]))
-    #print (type(contact_regions[0]))
 
-    #print (contact_regions[0][1].shape())
-    #print (contact_scores)
 
     np.save("pep1", contact_regions[0][0])
     np.save("pep2", contact_regions[0][1])
