@@ -97,10 +97,6 @@ def get_esm_target_bind_prob_score(sequences: List[str], batch_size :int = 4):
 
 
 
-    # following does not need a GPU, but I need to figure out how to call a CPU computation from GPU
-
-    # need to keep track of the target_prot_end_index, binder_start_index for each sequence in the batch
-
 def compute_esm_bind_aff_score_parallel(
     sequences: List[Tuple [str, List[int]]], num_workers: int = 2, batch_size_per_worker: int = 2
 ):
